@@ -1,0 +1,312 @@
+name: Construir la app de Android
+
+on:
+  push:
+    paths:
+      - 'index.html'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Bajar los archivos del repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Preparar Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Crear la clave de firma (solo la primera vez)
+        run: |
+          if [ ! -f keystore.jks ]; then
+            keytool -genkeypair -keystore keystore.jks -storepass teclas123 -keypass teclas123 -alias teclas -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Teclas y Manos"
+            git config user.name "github-actions"
+            git config user.email "github-actions@users.noreply.github.com"
+            git add keystore.jks
+            git commit -m "Clave de firma de la app"
+            git push
+          fi
+
+      - name: Armar el proyecto de Android
+        run: |
+          A=android/app/src/main
+          mkdir -p $A/java/ar/teclasymanos $A/assets $A/res/drawable
+          cp index.html $A/assets/index.html
+          curl -fsSL -o $A/assets/osmd.js https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.9.0/build/opensheetmusicdisplay.min.js
+          curl -fsSL -o $A/assets/midi.js https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/build/Midi.js
+          curl -fsSL -o $A/assets/jszip.js https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
+          curl -fsSL -o $A/assets/noto-music.woff2 https://cdn.jsdelivr.net/npm/@fontsource/noto-music@5.3.0/files/noto-music-music-400-normal.woff2
+          sed -i 's#https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.9.0/build/opensheetmusicdisplay.min.js#osmd.js#; s#https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/build/Midi.js#midi.js#; s#https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js#jszip.js#' $A/assets/index.html
+          sed -i '0,/<head>/s##<head><style>@font-face{font-family:"Noto Music";src:url(noto-music.woff2) format("woff2");}</style>#' $A/assets/index.html
+
+          cat > android/settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "TeclasYManos"
+          include(":app")
+          EOF
+
+          cat > android/build.gradle.kts <<'EOF'
+          plugins { id("com.android.application") version "8.5.2" apply false }
+          EOF
+
+          cat > android/app/build.gradle.kts <<'EOF'
+          plugins { id("com.android.application") }
+          val run = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+          android {
+              namespace = "ar.teclasymanos"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "ar.teclasymanos"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = run
+                  versionName = "1.$run"
+              }
+              signingConfigs {
+                  create("fija") {
+                      storeFile = file("../../keystore.jks")
+                      storePassword = "teclas123"
+                      keyAlias = "teclas"
+                      keyPassword = "teclas123"
+                  }
+              }
+              buildTypes { getByName("debug") { signingConfig = signingConfigs.getByName("fija") } }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+          }
+          EOF
+
+          cat > $A/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-feature android:name="android.software.midi" android:required="false" />
+              <application
+                  android:label="Teclas y Manos"
+                  android:icon="@drawable/ic_launcher"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar"
+                  android:usesCleartextTraffic="false">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > $A/res/drawable/ic_launcher.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="48" android:viewportHeight="48">
+              <path android:fillColor="#18202B" android:pathData="M10,2h28a8,8 0 0 1 8,8v28a8,8 0 0 1 -8,8h-28a8,8 0 0 1 -8,-8v-28a8,8 0 0 1 8,-8z"/>
+              <path android:fillColor="#FBFCFD" android:pathData="M9,18h9v20h-9z M19.5,18h9v20h-9z M30,18h9v20h-9z"/>
+              <path android:fillColor="#18202B" android:pathData="M15.5,18h5v12h-5z M26.5,18h5v12h-5z"/>
+              <path android:fillColor="#D3741A" android:pathData="M17,10m-4,0a4,4 0 1 0 8,0a4,4 0 1 0 -8,0"/>
+              <path android:fillColor="#53B3D8" android:pathData="M31,10m-4,0a4,4 0 1 0 8,0a4,4 0 1 0 -8,0"/>
+          </vector>
+          EOF
+
+          cat > $A/java/ar/teclasymanos/MainActivity.java <<'EOF'
+          package ar.teclasymanos;
+
+          import android.app.Activity;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.media.midi.MidiDevice;
+          import android.media.midi.MidiDeviceInfo;
+          import android.media.midi.MidiManager;
+          import android.media.midi.MidiOutputPort;
+          import android.media.midi.MidiReceiver;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.WindowManager;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class MainActivity extends Activity {
+              private WebView web;
+              private MidiManager midi;
+              private final Handler main = new Handler(Looper.getMainLooper());
+              private final List<MidiDevice> abiertos = new ArrayList<>();
+              private final List<MidiOutputPort> puertos = new ArrayList<>();
+              private ValueCallback<Uri[]> elegirArchivo;
+              private static final int PEDIDO_ARCHIVO = 7;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  web = new WebView(this);
+                  setContentView(web);
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setAllowFileAccess(true);
+                  s.setAllowFileAccessFromFileURLs(true);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  web.addJavascriptInterface(new Puente(), "TeclasAndroid");
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                          Uri u = r.getUrl();
+                          if ("http".equals(u.getScheme()) || "https".equals(u.getScheme())) {
+                              try { startActivity(new Intent(Intent.ACTION_VIEW, u)); } catch (Exception e) { }
+                              return true;
+                          }
+                          return false;
+                      }
+                      @Override
+                      public void onPageFinished(WebView v, String url) { buscarTeclados(); }
+                  });
+                  web.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public boolean onShowFileChooser(WebView v, ValueCallback<Uri[]> cb, FileChooserParams p) {
+                          if (elegirArchivo != null) elegirArchivo.onReceiveValue(null);
+                          elegirArchivo = cb;
+                          Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+                          i.addCategory(Intent.CATEGORY_OPENABLE);
+                          i.setType("*/*");
+                          try { startActivityForResult(Intent.createChooser(i, "Elegí una partitura"), PEDIDO_ARCHIVO); }
+                          catch (Exception e) { elegirArchivo = null; return false; }
+                          return true;
+                      }
+                  });
+                  web.loadUrl("file:///android_asset/index.html");
+                  midi = (MidiManager) getSystemService(Context.MIDI_SERVICE);
+                  if (midi != null) {
+                      midi.registerDeviceCallback(new MidiManager.DeviceCallback() {
+                          @Override public void onDeviceAdded(MidiDeviceInfo info) { abrir(info); }
+                          @Override public void onDeviceRemoved(MidiDeviceInfo info) { avisar("Se desconectó el teclado", false); }
+                      }, main);
+                  }
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  if (req == PEDIDO_ARCHIVO && elegirArchivo != null) {
+                      elegirArchivo.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(res, data));
+                      elegirArchivo = null;
+                  } else super.onActivityResult(req, res, data);
+              }
+
+              private void buscarTeclados() {
+                  if (midi == null) { avisar("Esta tablet no tiene soporte MIDI", false); return; }
+                  cerrarTodo();
+                  MidiDeviceInfo[] lista = midi.getDevices();
+                  boolean alguno = false;
+                  for (MidiDeviceInfo info : lista) if (info.getOutputPortCount() > 0) { abrir(info); alguno = true; }
+                  if (!alguno) avisar("No encuentro el teclado. Revisá el cable y tocá Buscar teclado", false);
+              }
+
+              private void abrir(MidiDeviceInfo info) {
+                  if (info.getOutputPortCount() == 0) return;
+                  final String nombre = nombreDe(info);
+                  midi.openDevice(info, device -> {
+                      if (device == null) { avisar("No pude abrir " + nombre, false); return; }
+                      abiertos.add(device);
+                      for (int i = 0; i < info.getOutputPortCount(); i++) {
+                          MidiOutputPort p = device.openOutputPort(i);
+                          if (p != null) { p.connect(new Lector()); puertos.add(p); }
+                      }
+                      avisar("Conectado: " + nombre, true);
+                  }, main);
+              }
+
+              private String nombreDe(MidiDeviceInfo info) {
+                  Bundle p = info.getProperties();
+                  String n = p.getString(MidiDeviceInfo.PROPERTY_NAME);
+                  if (n == null) n = p.getString(MidiDeviceInfo.PROPERTY_PRODUCT);
+                  return n == null ? "teclado MIDI" : n;
+              }
+
+              private void cerrarTodo() {
+                  for (MidiOutputPort p : puertos) try { p.close(); } catch (Exception e) { }
+                  for (MidiDevice d : abiertos) try { d.close(); } catch (Exception e) { }
+                  puertos.clear(); abiertos.clear();
+              }
+
+              private void avisar(String texto, boolean ok) {
+                  final String js = "window.nativeMidiStatus&&window.nativeMidiStatus(" + comillas(texto) + "," + ok + ")";
+                  main.post(() -> web.evaluateJavascript(js, null));
+              }
+
+              private static String comillas(String s) {
+                  return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'";
+              }
+
+              /* Lee los bytes que manda el cable: solo interesan las notas apretadas */
+              private class Lector extends MidiReceiver {
+                  private int estado = 0, dato1 = -1;
+                  @Override
+                  public void onSend(byte[] msg, int offset, int count, long ts) {
+                      for (int i = offset; i < offset + count; i++) {
+                          int b = msg[i] & 0xFF;
+                          if (b >= 0xF8) continue;
+                          if (b >= 0x80) { estado = b < 0xF0 ? b : 0; dato1 = -1; continue; }
+                          int tipo = estado & 0xF0;
+                          if (tipo != 0x90 && tipo != 0x80) continue;
+                          if (dato1 < 0) { dato1 = b; continue; }
+                          final int nota = dato1, vel = (tipo == 0x90) ? b : 0;
+                          dato1 = -1;
+                          if (vel > 0) main.post(() -> web.evaluateJavascript("window.nativeMidi&&window.nativeMidi(" + nota + "," + vel + ")", null));
+                      }
+                  }
+              }
+
+              private class Puente {
+                  @JavascriptInterface
+                  public void rescan() { main.post(MainActivity.this::buscarTeclados); }
+              }
+
+              @Override
+              protected void onDestroy() { cerrarTodo(); super.onDestroy(); }
+          }
+          EOF
+
+      - name: Compilar
+        run: |
+          cd android
+          gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Publicar el APK para descargar
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk TeclasYManos.apk
+          gh release create "v${{ github.run_number }}" TeclasYManos.apk --title "Teclas y Manos (versión ${{ github.run_number }})" --notes "Tocá TeclasYManos.apk para descargarla e instalarla en la tablet." --latest
+
+      - name: Guardar copia del APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: TeclasYManos-APK
+          path: TeclasYManos.apk
