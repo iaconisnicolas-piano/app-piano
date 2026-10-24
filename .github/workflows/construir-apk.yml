@@ -95,7 +95,7 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
-              <uses-feature android:name="android.software.midi" android:required="false" />
+              <uses-feature android:name="android.hardware.usb.host" android:required="false" />
               <application
                   android:label="Teclas y Manos"
                   android:icon="@drawable/ic_launcher"
@@ -104,15 +104,28 @@ jobs:
                   <activity
                       android:name=".MainActivity"
                       android:exported="true"
-                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize"
+                      android:launchMode="singleTask"
+                      android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale"
                       android:windowSoftInputMode="adjustResize">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+                      </intent-filter>
+                      <meta-data android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" android:resource="@xml/teclados_midi" />
                   </activity>
               </application>
           </manifest>
+          EOF
+
+          mkdir -p $A/res/xml
+          cat > $A/res/xml/teclados_midi.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <usb-device class="1" subclass="3" />
+          </resources>
           EOF
 
           cat > $A/res/drawable/ic_launcher.xml <<'EOF'
@@ -131,14 +144,19 @@ jobs:
           package ar.teclasymanos;
 
           import android.app.Activity;
+          import android.app.PendingIntent;
+          import android.content.BroadcastReceiver;
           import android.content.Context;
           import android.content.Intent;
-          import android.media.midi.MidiDevice;
-          import android.media.midi.MidiDeviceInfo;
-          import android.media.midi.MidiManager;
-          import android.media.midi.MidiOutputPort;
-          import android.media.midi.MidiReceiver;
+          import android.content.IntentFilter;
+          import android.hardware.usb.UsbConstants;
+          import android.hardware.usb.UsbDevice;
+          import android.hardware.usb.UsbDeviceConnection;
+          import android.hardware.usb.UsbEndpoint;
+          import android.hardware.usb.UsbInterface;
+          import android.hardware.usb.UsbManager;
           import android.net.Uri;
+          import android.os.Build;
           import android.os.Bundle;
           import android.os.Handler;
           import android.os.Looper;
@@ -150,22 +168,44 @@ jobs:
           import android.webkit.WebSettings;
           import android.webkit.WebView;
           import android.webkit.WebViewClient;
-          import java.util.ArrayList;
-          import java.util.List;
 
+          /* Lee el cable USB-MIDI directamente (como las apps de piano de la tienda),
+             sin pasar por el servicio MIDI de Android. */
           public class MainActivity extends Activity {
-              private WebView web;
-              private MidiManager midi;
-              private final Handler main = new Handler(Looper.getMainLooper());
-              private final List<MidiDevice> abiertos = new ArrayList<>();
-              private final List<MidiOutputPort> puertos = new ArrayList<>();
-              private ValueCallback<Uri[]> elegirArchivo;
+              private static final String PERMISO = "ar.teclasymanos.PERMISO_USB";
               private static final int PEDIDO_ARCHIVO = 7;
+              private WebView web;
+              private UsbManager usb;
+              private UsbDeviceConnection conexion;
+              private UsbInterface interfaz;
+              private Thread hilo;
+              private volatile boolean leyendo = false;
+              private boolean paginaLista = false;
+              private final Handler main = new Handler(Looper.getMainLooper());
+              private ValueCallback<Uri[]> elegirArchivo;
+
+              private final BroadcastReceiver receptor = new BroadcastReceiver() {
+                  @Override
+                  public void onReceive(Context c, Intent i) {
+                      String a = i.getAction();
+                      UsbDevice d = i.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                      if (PERMISO.equals(a)) {
+                          if (d != null && i.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) abrir(d);
+                          else avisar("Sin permiso para usar el cable. Tocá Buscar teclado y elegí Permitir", false);
+                      } else if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(a)) {
+                          main.postDelayed(MainActivity.this::buscarTeclados, 500);
+                      } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(a)) {
+                          cerrar();
+                          avisar("Se desconectó el teclado", false);
+                      }
+                  }
+              };
 
               @Override
               protected void onCreate(Bundle b) {
                   super.onCreate(b);
                   getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  usb = (UsbManager) getSystemService(Context.USB_SERVICE);
                   web = new WebView(this);
                   setContentView(web);
                   WebSettings s = web.getSettings();
@@ -186,7 +226,10 @@ jobs:
                           return false;
                       }
                       @Override
-                      public void onPageFinished(WebView v, String url) { buscarTeclados(); }
+                      public void onPageFinished(WebView v, String url) {
+                          paginaLista = true;
+                          buscarTeclados();
+                      }
                   });
                   web.setWebChromeClient(new WebChromeClient() {
                       @Override
@@ -201,14 +244,18 @@ jobs:
                           return true;
                       }
                   });
+                  IntentFilter f = new IntentFilter(PERMISO);
+                  f.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
+                  f.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
+                  if (Build.VERSION.SDK_INT >= 33) registerReceiver(receptor, f, Context.RECEIVER_NOT_EXPORTED);
+                  else registerReceiver(receptor, f);
                   web.loadUrl("file:///android_asset/index.html");
-                  midi = (MidiManager) getSystemService(Context.MIDI_SERVICE);
-                  if (midi != null) {
-                      midi.registerDeviceCallback(new MidiManager.DeviceCallback() {
-                          @Override public void onDeviceAdded(MidiDeviceInfo info) { abrir(info); }
-                          @Override public void onDeviceRemoved(MidiDeviceInfo info) { avisar("Se desconectó el teclado", false); }
-                      }, main);
-                  }
+              }
+
+              @Override
+              protected void onNewIntent(Intent i) {
+                  super.onNewIntent(i);
+                  if (paginaLista) main.postDelayed(this::buscarTeclados, 500);
               }
 
               @Override
@@ -219,77 +266,100 @@ jobs:
                   } else super.onActivityResult(req, res, data);
               }
 
+              /* Interfaz MIDI de un dispositivo USB: clase Audio (1), subclase MIDI Streaming (3) */
+              private UsbInterface interfazMidi(UsbDevice d) {
+                  for (int i = 0; i < d.getInterfaceCount(); i++) {
+                      UsbInterface f = d.getInterface(i);
+                      if (f.getInterfaceClass() == UsbConstants.USB_CLASS_AUDIO && f.getInterfaceSubclass() == 3 && entrada(f) != null) return f;
+                  }
+                  return null;
+              }
+
+              private UsbEndpoint entrada(UsbInterface f) {
+                  for (int e = 0; e < f.getEndpointCount(); e++) {
+                      UsbEndpoint ep = f.getEndpoint(e);
+                      if (ep.getDirection() == UsbConstants.USB_DIR_IN &&
+                          (ep.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK || ep.getType() == UsbConstants.USB_ENDPOINT_XFER_INT)) return ep;
+                  }
+                  return null;
+              }
+
               private void buscarTeclados() {
-                  if (midi == null) { avisar("Esta tablet no tiene soporte MIDI", false); return; }
-                  cerrarTodo();
-                  MidiDeviceInfo[] lista = midi.getDevices();
-                  boolean alguno = false;
-                  for (MidiDeviceInfo info : lista) if (info.getOutputPortCount() > 0) { abrir(info); alguno = true; }
-                  if (!alguno) avisar("No encuentro el teclado. Revisá el cable y tocá Buscar teclado", false);
-              }
-
-              private void abrir(MidiDeviceInfo info) {
-                  if (info.getOutputPortCount() == 0) return;
-                  final String nombre = nombreDe(info);
-                  midi.openDevice(info, device -> {
-                      if (device == null) { avisar("No pude abrir " + nombre, false); return; }
-                      abiertos.add(device);
-                      for (int i = 0; i < info.getOutputPortCount(); i++) {
-                          MidiOutputPort p = device.openOutputPort(i);
-                          if (p != null) { p.connect(new Lector()); puertos.add(p); }
+                  if (usb == null) { avisar("Esta tablet no permite conectar dispositivos USB", false); return; }
+                  if (leyendo) return;
+                  for (UsbDevice d : usb.getDeviceList().values()) {
+                      if (interfazMidi(d) == null) continue;
+                      if (usb.hasPermission(d)) abrir(d);
+                      else {
+                          Intent pi = new Intent(PERMISO).setPackage(getPackageName());
+                          int flags = Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0;
+                          usb.requestPermission(d, PendingIntent.getBroadcast(this, 0, pi, flags));
+                          avisar("Tocá Permitir para usar el cable del teclado", false);
                       }
-                      avisar("Conectado: " + nombre, true);
-                  }, main);
+                      return;
+                  }
+                  avisar("No encuentro el teclado. Revisá el cable y tocá Buscar teclado", false);
               }
 
-              private String nombreDe(MidiDeviceInfo info) {
-                  Bundle p = info.getProperties();
-                  String n = p.getString(MidiDeviceInfo.PROPERTY_NAME);
-                  if (n == null) n = p.getString(MidiDeviceInfo.PROPERTY_PRODUCT);
-                  return n == null ? "teclado MIDI" : n;
+              private void abrir(UsbDevice d) {
+                  cerrar();
+                  UsbInterface f = interfazMidi(d);
+                  if (f == null) return;
+                  final UsbEndpoint ep = entrada(f);
+                  UsbDeviceConnection c = usb.openDevice(d);
+                  if (c == null) { avisar("No pude abrir el cable", false); return; }
+                  if (!c.claimInterface(f, true)) { c.close(); avisar("Otra app está usando el cable. Cerrala y tocá Buscar teclado", false); return; }
+                  conexion = c;
+                  interfaz = f;
+                  leyendo = true;
+                  String n = d.getProductName();
+                  avisar("Conectado: " + (n == null || n.trim().isEmpty() ? "cable MIDI" : n.trim()), true);
+                  final UsbDeviceConnection con = c;
+                  hilo = new Thread(() -> {
+                      byte[] buf = new byte[Math.max(64, ep.getMaxPacketSize())];
+                      while (leyendo) {
+                          int k = con.bulkTransfer(ep, buf, buf.length, 250);
+                          if (k <= 0) continue;
+                          /* Cada evento USB-MIDI ocupa 4 bytes: encabezado + mensaje MIDI */
+                          for (int i = 0; i + 3 < k; i += 4) {
+                              int st = buf[i + 1] & 0xFF, nota = buf[i + 2] & 0x7F, vel = buf[i + 3] & 0x7F;
+                              if ((st & 0xF0) == 0x90 && vel > 0) {
+                                  final String js = "window.nativeMidi&&window.nativeMidi(" + nota + "," + vel + ")";
+                                  main.post(() -> web.evaluateJavascript(js, null));
+                              }
+                          }
+                      }
+                  }, "lector-midi");
+                  hilo.start();
               }
 
-              private void cerrarTodo() {
-                  for (MidiOutputPort p : puertos) try { p.close(); } catch (Exception e) { }
-                  for (MidiDevice d : abiertos) try { d.close(); } catch (Exception e) { }
-                  puertos.clear(); abiertos.clear();
+              private void cerrar() {
+                  leyendo = false;
+                  if (hilo != null) { try { hilo.join(400); } catch (InterruptedException e) { } hilo = null; }
+                  if (conexion != null) {
+                      try { if (interfaz != null) conexion.releaseInterface(interfaz); } catch (Exception e) { }
+                      try { conexion.close(); } catch (Exception e) { }
+                  }
+                  conexion = null;
+                  interfaz = null;
               }
 
               private void avisar(String texto, boolean ok) {
-                  final String js = "window.nativeMidiStatus&&window.nativeMidiStatus(" + comillas(texto) + "," + ok + ")";
+                  final String js = "window.nativeMidiStatus&&window.nativeMidiStatus('" + texto.replace("\\", "\\\\").replace("'", "\\'") + "'," + ok + ")";
                   main.post(() -> web.evaluateJavascript(js, null));
-              }
-
-              private static String comillas(String s) {
-                  return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'";
-              }
-
-              /* Lee los bytes que manda el cable: solo interesan las notas apretadas */
-              private class Lector extends MidiReceiver {
-                  private int estado = 0, dato1 = -1;
-                  @Override
-                  public void onSend(byte[] msg, int offset, int count, long ts) {
-                      for (int i = offset; i < offset + count; i++) {
-                          int b = msg[i] & 0xFF;
-                          if (b >= 0xF8) continue;
-                          if (b >= 0x80) { estado = b < 0xF0 ? b : 0; dato1 = -1; continue; }
-                          int tipo = estado & 0xF0;
-                          if (tipo != 0x90 && tipo != 0x80) continue;
-                          if (dato1 < 0) { dato1 = b; continue; }
-                          final int nota = dato1, vel = (tipo == 0x90) ? b : 0;
-                          dato1 = -1;
-                          if (vel > 0) main.post(() -> web.evaluateJavascript("window.nativeMidi&&window.nativeMidi(" + nota + "," + vel + ")", null));
-                      }
-                  }
               }
 
               private class Puente {
                   @JavascriptInterface
-                  public void rescan() { main.post(MainActivity.this::buscarTeclados); }
+                  public void rescan() { main.post(() -> { cerrar(); buscarTeclados(); }); }
               }
 
               @Override
-              protected void onDestroy() { cerrarTodo(); super.onDestroy(); }
+              protected void onDestroy() {
+                  cerrar();
+                  try { unregisterReceiver(receptor); } catch (Exception e) { }
+                  super.onDestroy();
+              }
           }
           EOF
 
